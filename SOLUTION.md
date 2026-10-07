@@ -96,6 +96,10 @@ The version isn't written in the `Dockerfile`. It's the tag I give the image whe
 | `v1` | `python:3.12-slim-bookworm` | First production image                                 |
 | `v2` | `python:3.12-slim-trixie`   | Moved to Debian 13; removed pip from the runtime image |
 
+Each image version has a matching Git tag on the commit it was built from, so you can always see exactly which code is in which image. The tag messages also record the image digest.
+
+Both images are built for `linux/amd64`, which is what most Kubernetes clusters run on. The base image supports arm64 too, so an arm64 build is a matter of building for that platform and publishing it under a new tag.
+
 ## Trying it yourself
 
 A note for Windows users: in PowerShell, type `curl.exe` rather than `curl`, because there `curl` is a shortcut for a different command, `Invoke-WebRequest`.
