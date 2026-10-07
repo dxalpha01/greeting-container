@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-ARG PYTHON_IMAGE=python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258
+ARG PYTHON_IMAGE=python:3.12-slim-trixie@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
 
 # ---- Build stage: install dependencies into an isolated virtualenv ----
 FROM ${PYTHON_IMAGE} AS builder
@@ -13,7 +13,8 @@ ENV PATH="/opt/venv/bin:$PATH"
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=bind,source=app/requirements.txt,target=/tmp/requirements.txt \
     --mount=type=bind,source=constraints.txt,target=/tmp/constraints.txt \
-    pip install --require-virtualenv -r /tmp/requirements.txt -c /tmp/constraints.txt
+    pip install --require-virtualenv -r /tmp/requirements.txt -c /tmp/constraints.txt \
+ && pip uninstall --yes pip
 
 # ---- Runtime stage: minimal image with only the venv and app code ----
 FROM ${PYTHON_IMAGE} AS runtime
@@ -32,13 +33,14 @@ ENV PATH="/opt/venv/bin:$PATH" \
     WEB_CONCURRENCY=2 \
     GUNICORN_CMD_ARGS="--worker-tmp-dir /dev/shm --access-logfile - --error-logfile -"
 
-RUN groupadd --system --gid 10001 app \
+RUN /usr/local/bin/python -m pip uninstall --yes pip \
+ && groupadd --system --gid 10001 app \
  && useradd --system --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app
 
 WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
-COPY --chmod=u=rwX,go=rX app/ ./app/    
+COPY --chmod=u=rwX,go=rX app/ ./app/
 
 USER 10001:10001
 
