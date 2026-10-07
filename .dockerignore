@@ -1,0 +1,6 @@
+# Only app/ and the dependency constraints are needed in the build context.
+*
+!app/
+!constraints.txt
+app/**/__pycache__
+app/**/*.py[cod]
