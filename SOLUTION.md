@@ -1,91 +1,106 @@
-﻿# Solution: Containerising the Greeting App
+﻿# Containerising the Greeting App
 
-This document describes my solution to the task in [README.md](README.md).
+This is my write-up for the task described in [README.md](README.md). The short version: I rewrote the `Dockerfile` so the image is smaller, runs as a non-root user, builds reproducibly and works under the restrictions you'd expect in a hardened Kubernetes cluster. I then added a smoke test and a CI pipeline so those properties stay true.
 
-**Image:** [`ghcr.io/dxalpha01/sample-app:v2`](https://github.com/users/dxalpha01/packages/container/package/sample-app) (public, no credentials needed)
+The image is public, so you can pull it without logging in:
 
 ```sh
 docker run --rm -p 8080:8080 -e GREETING="Hello" ghcr.io/dxalpha01/sample-app:v2
 curl http://localhost:8080/
 ```
 
-## What changed
+You can find it on the [GHCR package page](https://github.com/users/dxalpha01/packages/container/package/sample-app). `v2` is the version to use.
+
+## What I changed
+
+I didn't touch anything in `app/`. Everything else I added or changed is listed here:
 
 ```text
-Dockerfile                    # rewritten: multi-stage, non-root production image
-.dockerignore                 # new: only app/ and constraints.txt are sent to the build
-constraints.txt               # new: pins the full dependency tree for reproducible builds
-scripts/smoke-test.sh         # new: builds (or pulls) the image and checks it end to end
-.github/workflows/ci.yml      # new: Hadolint, build, smoke test and Trivy scan on every push
-.gitattributes                # new: keeps shell scripts on LF line endings
+Dockerfile                    # rewritten
+.dockerignore                 # new: only app/ and constraints.txt go into the build
+constraints.txt               # new: pins every dependency, not just the top-level ones
+scripts/smoke-test.sh         # new: runs the image and checks it behaves as described below
+.github/workflows/ci.yml      # new: lints, builds, tests and scans the image on every push
+.gitattributes                # new: keeps the shell script working when checked out on Windows
 SOLUTION.md                   # new: this document
-CONTAINER-BEST-PRACTICES.md   # new: why each supporting change was made, and next steps
-app/                          # unmodified
+CONTAINER-BEST-PRACTICES.md   # new: the reasoning behind each supporting file, and next steps
 ```
 
-[CONTAINER-BEST-PRACTICES.md](CONTAINER-BEST-PRACTICES.md) explains each supporting change in detail.
+[CONTAINER-BEST-PRACTICES.md](CONTAINER-BEST-PRACTICES.md) goes into more detail on the supporting files. This document focuses on the image itself and how to use it.
 
-## Configuration
+## Configuring the container
 
-All settings are environment variables, so they can be set in a Kubernetes manifest without changing the image or its command.
+Everything is controlled through environment variables, so whoever deploys it can change the behaviour from a Kubernetes manifest without rebuilding the image or touching its command.
 
-| Variable            | Default                                                          | Purpose                             |
+| Variable            | Default                                                          | What it does                        |
 | ------------------- | ---------------------------------------------------------------- | ----------------------------------- |
-| `GREETING`          | `Hello from the sample app!`                                     | Message returned by `GET /`         |
-| `PORT`              | `8080`                                                           | Port gunicorn binds to on `0.0.0.0` |
-| `WEB_CONCURRENCY`   | `2`                                                              | Number of gunicorn worker processes |
-| `GUNICORN_CMD_ARGS` | `--worker-tmp-dir /dev/shm --access-logfile - --error-logfile -` | Extra gunicorn flags                |
+| `GREETING`          | `Hello from the sample app!`                                     | The message returned by `GET /`     |
+| `PORT`              | `8080`                                                           | The port gunicorn listens on        |
+| `WEB_CONCURRENCY`   | `2`                                                              | How many gunicorn worker processes  |
+| `GUNICORN_CMD_ARGS` | `--worker-tmp-dir /dev/shm --access-logfile - --error-logfile -` | Extra gunicorn settings (see below) |
 
-For Kubernetes, use `/healthz` for liveness and readiness probes. The container runs as UID/GID `10001` and works with `readOnlyRootFilesystem: true`, `runAsNonRoot: true` and all capabilities dropped.
+If you're writing the Kubernetes manifest, the useful facts are: use `/healthz` for the liveness and readiness probes, and the container runs as UID and GID `10001`. It works with `runAsNonRoot: true`, `readOnlyRootFilesystem: true` and all capabilities dropped; the smoke test checks the Docker equivalents of all three.
 
-## Dockerfile design
+## How the Dockerfile works, and why
 
-### Smaller, safer image
+### Where I started
 
--   **Current, slim base image, pinned by digest.** `python:3.12-slim-trixie` (Debian 13) replaces the full `python:3.12` image. Debian 12 left regular security support in July 2026 and now receives long-term-support updates only, so a new image should not start on it. The digest is the multi-architecture index, so builds are reproducible on both amd64 and arm64.
--   **Multi-stage build.** Dependencies are installed into a virtual environment in a `builder` stage. Only that environment and the application code are copied into the runtime stage.
--   **No build or debugging tools.** `build-essential`, `gcc`, `curl` and `vim` are removed. Flask and gunicorn are pure Python, so no compiler is needed, and fewer tools mean a smaller attack surface.
--   **No package installer at runtime.** pip is only needed to build the virtual environment. It is uninstalled from the virtual environment in the builder stage and from the base image's Python in the runtime stage, so it cannot be used to install anything into a running container. This also removed every fixable Python vulnerability that the `v1` scan found.
--   **Minimal build context.** `.dockerignore` excludes everything except `app/` and `constraints.txt`, so `.git`, documentation and local files never reach the image.
+The original `Dockerfile` worked, but it built on the full `python:3.12` image and installed `gcc`, `build-essential`, `curl` and `vim` on top. It copied the whole repository into the image and ran everything as root. None of those tools are needed to run a Flask app: Flask and gunicorn are pure Python, so there's nothing to compile. Each of them is extra size and extra attack surface.
 
-### Security
+### A smaller, current base image
 
--   **Non-root user.** The container runs as a dedicated system user with a fixed UID (`10001`), so Kubernetes `runAsNonRoot` can verify it.
--   **Read-only application code.** Application files are owned by root and readable, but not writable, by the app user. `--chmod=u=rwX,go=rX` makes permissions independent of the build machine's umask.
--   **Read-only root filesystem.** Gunicorn's worker heartbeat files go to `/dev/shm`, so the container needs no writable paths. The original image crashes on a read-only filesystem.
--   **Health check without extra tools.** `HEALTHCHECK` calls `/healthz` with Python's built-in `urllib` rather than installing `curl`.
+I switched to `python:3.12-slim-trixie`, the slim variant of the official Python image on Debian 13. I originally used Debian 12 (`bookworm`) for `v1`. I moved to Debian 13 for `v2` because Debian 12's regular security support ended in July 2026, and it's hard to justify starting a new production image on a release that only gets long-term-support updates.
 
-### Build efficiency and reproducibility
+The base image is pinned by digest as well as by tag. The tag `3.12-slim-trixie` moves whenever Docker publishes an update, but the digest always refers to the same image, so every build starts from exactly the same place. The digest I pinned is the multi-architecture one, so this works on both amd64 and arm64 machines.
 
--   **Layer ordering.** Dependencies are installed before the application code is copied, so code changes don't reinstall dependencies.
--   **BuildKit cache and bind mounts.** pip's download cache persists between builds, and `requirements.txt` is bind-mounted rather than copied into a layer.
--   **Locked transitive dependencies.** `app/requirements.txt` only pins Flask and gunicorn. `constraints.txt` pins everything else (Werkzeug, Jinja2, click and so on), so two builds of the same commit produce the same dependency set.
--   **Bytecode precompiled at build time.** pip compiles `.pyc` files in the builder stage. `PYTHONDONTWRITEBYTECODE` is set only at runtime, where the app user cannot write them anyway.
+### Two build stages
 
-### Runtime behaviour
+The `Dockerfile` has two stages. The first one, `builder`, creates a Python virtual environment and installs the dependencies into it. The second one, which becomes the final image, starts again from a clean base and copies across only that virtual environment and the application code. Anything used during the build stays behind.
 
--   **Gunicorn remains the container command** (`gunicorn --chdir app app:app`), and the original `/app/app` layout is kept, so manifests that reuse the original command still work.
--   **Gunicorn flags live in the environment.** If a Kubernetes manifest overrides `args`, the logging and `/dev/shm` settings survive.
--   **Logs to stdout/stderr** with unbuffered Python output, for `kubectl logs` and log collectors.
--   **Clean shutdown.** Gunicorn runs as PID 1 (exec-form `CMD`), so it receives `SIGTERM` directly and exits gracefully.
--   **OCI labels.** `org.opencontainers.image.source` links the GHCR package to this repository.
+pip is one of those things. It's needed to install the dependencies, but once they're installed it has no job left to do, and a package installer inside a running container is a tool an attacker could use. So I uninstall it from the virtual environment at the end of the build stage, and from the base image's own Python in the final stage. That also cleared every fixable Python vulnerability that my scan of `v1` had found, all of which were in pip.
 
-## Versioning
+I also added a `.dockerignore` that works as an allow-list. It excludes everything except `app/` and `constraints.txt`, so `.git`, documentation and anything else lying around never reach the build.
 
-The version is not set in the `Dockerfile`. It is the image tag, chosen at build time with `-t`. Each release gets a new tag; existing tags are never overwritten, so a deployment that references a tag always gets the same image.
+### Running safely
 
-| Tag  | Base image                  | Changes                                                |
+The container runs as a dedicated user with a fixed ID, `10001`, rather than root. Using a number rather than just a name matters in Kubernetes: `runAsNonRoot` can only verify that a container isn't root if the image declares a numeric user.
+
+The application files are owned by root and are readable but not writable by that user, so a compromised process can't modify the code it's running. I set the permissions explicitly with `--chmod=u=rwX,go=rX` so the result doesn't depend on how the files happened to be checked out on whichever machine did the build.
+
+One change was needed for read-only filesystems. Gunicorn's worker processes regularly write small heartbeat files so the main process can tell they're still alive. By default these go to a normal temporary directory, which doesn't exist when the root filesystem is read-only. The original image simply crashes in that situation. I pointed them at `/dev/shm`, which is in memory and always writable, so the container no longer needs any writable disk at all.
+
+The health check calls `/healthz` using Python's built-in `urllib`, so I didn't have to install `curl` just for that.
+
+### Faster, repeatable builds
+
+The dependencies are installed before the application code is copied in. Docker caches each step, so if you only change `app.py`, the rebuild skips the dependency installation entirely. pip's download cache is also kept between builds using a BuildKit cache mount. `requirements.txt` is mounted into the install step rather than copied into the image.
+
+Repeatability was the other gap. `app/requirements.txt` pins Flask and gunicorn, but not the packages they depend on, such as Werkzeug, Jinja2 and click. Two builds a month apart could quietly end up with different versions. The task said not to modify `app/`, so I added `constraints.txt` at the root, which pins the complete dependency tree. pip reads it alongside `requirements.txt`: `requirements.txt` still decides what gets installed, and `constraints.txt` decides which version.
+
+### Behaving well at runtime
+
+Gunicorn is still the container's command (`gunicorn --chdir app app:app`), as the task asked. I kept the application at `/app/app`, the same location as the original image, so any manifest that copies the original command still works.
+
+I put gunicorn's settings in the `GUNICORN_CMD_ARGS` environment variable rather than on the command line. Kubernetes lets a manifest replace a container's command arguments, and if the settings lived there they'd disappear along with them, including the `/dev/shm` fix. In an environment variable, they survive.
+
+Logs go to standard output and error with Python's output buffering turned off, so they show up in `docker logs` and `kubectl logs` straight away. Gunicorn runs as the container's main process, so when Kubernetes asks it to stop, it receives the signal directly, finishes any requests in progress and exits cleanly.
+
+Finally, the image carries standard labels, including one that links the GHCR package back to this repository, so anyone who finds the image can find the code that built it.
+
+## Versions
+
+The version isn't written in the `Dockerfile`. It's the tag I give the image when I build it, using `-t`. I never overwrite a tag once it's published: a deployment that references `v1` will always get exactly the image that was tested as `v1`.
+
+| Tag  | Base image                  | What changed                                           |
 | ---- | --------------------------- | ------------------------------------------------------ |
 | `v1` | `python:3.12-slim-bookworm` | First production image                                 |
 | `v2` | `python:3.12-slim-trixie`   | Moved to Debian 13; removed pip from the runtime image |
 
-`v2` is the version to deploy. `v1` is kept unchanged.
+## Trying it yourself
 
-## Testing locally
+A note for Windows users: in PowerShell, type `curl.exe` rather than `curl`, because there `curl` is a shortcut for a different command, `Invoke-WebRequest`.
 
-The examples use `curl`. In Windows PowerShell, type `curl.exe`, because `curl` is an alias for `Invoke-WebRequest` there.
-
-### Run and call the endpoints
+### Start it and call the endpoints
 
 ```sh
 docker run -d --name sample-app -p 8080:8080 -e GREETING="Hello" ghcr.io/dxalpha01/sample-app:v2
@@ -95,53 +110,53 @@ curl http://localhost:8080/healthz   # {"status":"ok"}
 curl http://localhost:8080/info      # {"greeting":"Hello","hostname":"...","port":8080}
 ```
 
-### Inspect the running container
+### Look inside it
 
 ```sh
-docker logs sample-app                                         # gunicorn start-up and access logs
+docker logs sample-app                                         # gunicorn's start-up and access logs
 docker exec sample-app id                                      # uid=10001(app) gid=10001(app)
-docker inspect --format '{{.State.Health.Status}}' sample-app  # healthy (after about 30 seconds)
+docker inspect --format '{{.State.Health.Status}}' sample-app  # "healthy", after about 30 seconds
 docker stop sample-app                                         # should stop within a second or two
 docker rm sample-app
 ```
 
-### Run it the way Kubernetes would
+### Run it the way a locked-down cluster would
 
-This uses a read-only filesystem, drops all capabilities and changes the port:
+This makes the filesystem read-only, removes every Linux capability and moves the app to a different port:
 
 ```sh
 docker run --rm -p 9090:9090 -e PORT=9090 --read-only --cap-drop ALL --security-opt no-new-privileges ghcr.io/dxalpha01/sample-app:v2
 curl http://localhost:9090/info      # "port":9090
 ```
 
-To test a local build instead of the published image, build it first with `docker build -t sample-app:dev .` and use `sample-app:dev` in place of `ghcr.io/dxalpha01/sample-app:v2`.
+To try your own build instead of the published one, run `docker build -t sample-app:dev .` first and use `sample-app:dev` in place of the GHCR name.
 
 ### Run the smoke test
 
-`scripts/smoke-test.sh` automates the checks above. It needs Docker and curl; on Windows, run it from Git Bash. With no argument it builds the image from this repository; with an argument it tests an existing image:
+`scripts/smoke-test.sh` does all of the above automatically. You'll need Docker and curl; on Windows, run it from Git Bash. Without an argument it builds the image from this repository first. With an image name, it tests that image instead:
 
 ```sh
 ./scripts/smoke-test.sh                                    # build and test the local Dockerfile
 ./scripts/smoke-test.sh ghcr.io/dxalpha01/sample-app:v2    # test the published image
 ```
 
-It runs the container with a read-only root filesystem, all capabilities dropped and a non-default `PORT`, then checks that:
+It runs the container with a read-only filesystem, no capabilities and a non-default port, then checks that:
 
--   the image is configured to run as UID 10001 and contains no compilers, `curl`, `vim` or pip
--   application files are not writable by the app user
--   `/healthz`, `/` and `/info` respond correctly and honour `GREETING` and `PORT`
--   access logs reach stdout and the Docker health check reports `healthy`
--   the container stops cleanly on `SIGTERM`
+-   the image runs as UID 10001, and contains no compilers, `curl`, `vim` or pip
+-   the app user can't modify the application files
+-   `/healthz`, `/` and `/info` respond correctly and pick up `GREETING` and `PORT`
+-   access logs reach standard output, and Docker's health check reports `healthy`
+-   the container shuts down cleanly when asked to stop
 
-The script exits non-zero if any check fails and prints the container logs. Run against the original Dockerfile, it fails the non-root, tooling and file-permission checks, and the container crashes on a read-only filesystem.
+If anything fails, the script says which check failed, prints the container's logs and exits with an error. To make sure it actually catches problems, I ran it against an image built from the original commit. That image fails the non-root, tooling, pip and file-permission checks, then crashes as soon as it starts on a read-only filesystem.
 
 ## Continuous integration
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push and pull request. It lints the `Dockerfile` with Hadolint, builds the image, runs the smoke test, and scans the image with Trivy, failing on any HIGH or CRITICAL vulnerability that has a fix available. The tools are pinned by digest or commit. See [CONTAINER-BEST-PRACTICES.md](CONTAINER-BEST-PRACTICES.md#githubworkflowsciyml-continuous-integration) for details.
+Checks only help if they run, so [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push and pull request. It lints the `Dockerfile` with Hadolint, builds the image, runs the smoke test and scans the result with Trivy. The scan fails the build if it finds a HIGH or CRITICAL vulnerability that has a fix available. The tools are pinned to exact versions so that a change upstream can't silently alter what the pipeline runs. [CONTAINER-BEST-PRACTICES.md](CONTAINER-BEST-PRACTICES.md#githubworkflowsciyml-continuous-integration) has the details.
 
-## Publishing
+## Publishing a new version
 
-Log in to GHCR with a classic personal access token that has the `write:packages` scope, then build and push a new version tag:
+Log in to GHCR with a classic personal access token that has the `write:packages` scope, then build and push with a new tag:
 
 ```sh
 echo "$GITHUB_TOKEN" | docker login ghcr.io -u dxalpha01 --password-stdin
@@ -151,7 +166,7 @@ docker push ghcr.io/dxalpha01/sample-app:v2
 
 ## Vulnerability scan
 
-`v2` was scanned with Trivy 0.75.0:
+I scanned both versions with Trivy 0.75.0:
 
 | Area                                  | `v1` (Debian 12, with pip)  | `v2` (Debian 13, no pip)  |
 | ------------------------------------- | --------------------------- | ------------------------- |
@@ -159,15 +174,16 @@ docker push ghcr.io/dxalpha01/sample-app:v2
 | Operating-system packages             | 264 (2 critical, 53 high)   | 165 (0 critical, 44 high) |
 | HIGH or CRITICAL with a fix available | 0                           | 0                         |
 
--   **The application dependencies are clean.** Flask, Werkzeug, Jinja2 and gunicorn have no findings. Gunicorn's request-smuggling advisories ([CVE-2024-6827](https://github.com/advisories/GHSA-hc5x-x2vx-497g), [CVE-2024-1135](https://github.com/advisories/GHSA-w3h3-4rj7-4ph4)) affect versions below 22.0.0, so the pinned `22.0.0` is not affected.
--   **The remaining findings have no fix available yet.** They are in Debian 13 system packages such as `util-linux`, `ncurses` and `systemd` libraries, which the app does not call directly. Debian has not yet published fixed versions. Rebuilding the image picks up fixes once it does, and the CI scan fails if a fixable HIGH or CRITICAL finding appears.
+The application's own dependencies are clean: Flask, Werkzeug, Jinja2 and gunicorn have no findings. I specifically checked gunicorn's request-smuggling advisories, [CVE-2024-6827](https://github.com/advisories/GHSA-hc5x-x2vx-497g) and [CVE-2024-1135](https://github.com/advisories/GHSA-w3h3-4rj7-4ph4), because they're the obvious concern for a Python web server. Both only affect versions below 22.0.0, and this image uses 22.0.0.
 
-Reproduce the scan:
+The 165 findings that remain are in Debian 13 system packages, such as `util-linux`, `ncurses` and the `systemd` libraries, which the app doesn't use directly. Debian hasn't published fixes for any of them yet. Rebuilding the image picks the fixes up once it does. In the meantime, the CI scan will fail as soon as a fixable HIGH or CRITICAL issue appears.
+
+To run the scan yourself:
 
 ```sh
 docker run --rm aquasec/trivy:0.75.0 image --db-repository ghcr.io/aquasecurity/trivy-db:2 ghcr.io/dxalpha01/sample-app:v2
 ```
 
-## Known issues
+## Known quirks
 
--   **Builds on Windows set the execute bit on application files.** Windows build contexts mark every file as executable, and `--chmod=u=rwX` preserves an existing execute bit. This is harmless because the files are still read-only to the app user. Builds on Linux, macOS or CI produce `0644` files.
+If you build the image on Windows, the application files end up marked as executable. Windows doesn't have Unix-style permissions, so Docker treats every file it sends from a Windows machine as executable, and my `--chmod` setting keeps that bit rather than removing it. It's harmless, because the files are still read-only to the app user, and builds on Linux, macOS or in CI produce normal non-executable files.
